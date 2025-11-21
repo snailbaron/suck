@@ -13,7 +13,7 @@ dependencies = [
     "colorama>=0.4.6",
     "pydantic>=2.12.4",
     "pyyaml>=6.0.3",
-    "tqdm>=4.67.1",
+    "rich>=14.2.0",
 ]
 
 [project.scripts]
