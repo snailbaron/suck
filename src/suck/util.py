@@ -9,7 +9,7 @@ from typing import TextIO
 class FileOrStdin:
     def __init__(self, path_or_none: Path | None) -> None:
         self._path = path_or_none
-        self._file = None
+        self._file: TextIO | None = None
 
     def __enter__(self) -> TextIO:
         if self._path:
@@ -23,12 +23,9 @@ class FileOrStdin:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> None:
         if self._file:
             self._file.close()
-
-        # do not suppress the exception
-        return False
 
 
 async def gather_with_limit(limit: int, *coros: Coroutine[None, None, None]) -> None:
