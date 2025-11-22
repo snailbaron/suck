@@ -6,251 +6,148 @@ import logging
 import shutil
 import sys
 import urllib.parse
-from collections.abc import AsyncGenerator, Coroutine
+from collections.abc import Coroutine, Sequence
 from pathlib import Path
-from typing import Any, override
 
-import aiofiles
-import aiofiles.os
 import aiohttp
-import colorama
 import pydantic
 import rich.progress
 import yaml
 
+from . import input_model, util
+from .log import log, setup_log
+
 CHUNK_SIZE_BYTES = 1 << 20
 
-log = logging.getLogger("suck")
 
-
-class LogFormatter(logging.Formatter):
-    @override
-    def format(self, record: logging.LogRecord) -> str:
-        s = super().format(record)
-        end = colorama.Style.RESET_ALL
-
-        match record.levelno:
-            case logging.DEBUG:
-                return colorama.Style.DIM + colorama.Fore.WHITE + s + end
-            case logging.WARNING:
-                return colorama.Fore.YELLOW + s + end
-            case logging.ERROR:
-                return colorama.Fore.RED + s + end
-            case _:
-                return s
-
-
-def setup_log():
-    formatter = LogFormatter(
-        "[%(asctime)s] - %(levelname)s - %(message)s", datefmt="%Y-%M-%d %H-%M-%S %z"
-    )
-
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(formatter)
-
-    log.addHandler(handler)
-    log.setLevel(logging.INFO)
-
-
-class Model(pydantic.BaseModel):
-    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
-
-
-class FileInput(Model):
+@dataclasses.dataclass(frozen=True)
+class FileInfo:
     url: str
-    checksum: str | None = None
-    checksum_type: str | None = None
+    checksum_type: str
+    checksum: str | None
+
+    def name(self) -> str:
+        return urllib.parse.urlparse(self.url).path.rpartition("/")[-1]
 
 
-class Input(Model):
-    default_checksum_type: str = "md5"
-    files: list[FileInput]
-
-
-@dataclasses.dataclass
-class ProgressInfo:
-    progress: rich.progress.Progress
-    task_id: rich.progress.TaskID
-
-    def start_task(self) -> None:
-        self.progress.start_task(self.task_id)
-
-    def stop_task(self) -> None:
-        self.progress.stop_task(self.task_id)
-
-    def update(
-        self,
-        total: float | None = None,
-        completed: float | None = None,
-        advance: float | None = None,
-        description: str | None = None,
-        visible: bool | None = None,
-        refresh: bool = False,
-        **fields: Any,
-    ) -> None:
-        self.progress.update(
-            self.task_id,
-            total=total,
-            completed=completed,
-            advance=advance,
-            description=description,
-            visible=visible,
-            refresh=refresh,
-            **fields,
-        )
-
-
-async def check_file_hash(
-    pr: ProgressInfo, *, file_path: Path, checksum_type: str, checksum: str
-) -> bool:
+def get_file_checksum(file_path: Path, checksum_type: str) -> str:
     file_hash = hashlib.new(checksum_type)
-    file_name = file_path.name
 
-    existing_file_size = (await aiofiles.os.stat(file_path)).st_size
-    pr.start_task()
-    pr.update(
-        total=existing_file_size, completed=0, description=f"{file_name}: checking hash"
-    )
-
-    async with aiofiles.open(file_path, "rb") as f:
-        while chunk := await f.read(CHUNK_SIZE_BYTES):
+    with file_path.open("rb") as f:
+        while chunk := f.read(CHUNK_SIZE_BYTES):
             file_hash.update(chunk)
-            pr.update(advance=len(chunk))
 
-    if file_hash.hexdigest() == checksum:
-        pr.update(description=f"{file_name}: in place")
-        return True
+    return file_hash.hexdigest()
+
+
+def check_existing_file_hashes(
+    files_info: Sequence[FileInfo], output_path: Path
+) -> list[FileInfo]:
+    log.info("checking existing files")
+
+    checksum_match_count = 0
+    files_to_download: list[FileInfo] = []
+    for fi in files_info:
+        file_path = output_path / fi.name()
+
+        if file_path.exists() and fi.checksum:
+            file_real_checksum = get_file_checksum(file_path, fi.checksum_type)
+            if file_real_checksum == fi.checksum:
+                checksum_match_count += 1
+            else:
+                log.warning("%s: checksum mismatch", file_path)
+                files_to_download.append(fi)
+        else:
+            files_to_download.append(fi)
+
+    if checksum_match_count > 0:
+        log.info(
+            "%d files to download (%d already downloaded)",
+            len(files_to_download),
+            checksum_match_count,
+        )
     else:
-        pr.update(description=f"{file_name}: mismatch")
-        return False
+        log.info("%d files to download", len(files_to_download))
+
+    return files_to_download
 
 
 async def download_file(
-    pr: ProgressInfo,
     *,
-    file_path: Path,
-    checksum_type: str,
-    checksum: str | None,
+    progress: rich.progress.Progress,
     session: aiohttp.ClientSession,
-    url: str,
+    file_info: FileInfo,
+    output_path: Path,
 ) -> None:
-    file_name = file_path.name
+    task_id = progress.add_task(description=f"{file_info.name()}", start=False)
 
-    pr.update(description=f"{file_name}: requesting")
-
-    downloaded_file_hash = hashlib.new(checksum_type)
+    file_name = file_info.name()
+    file_path = output_path / file_name
+    downloaded_file_hash = hashlib.new(file_info.checksum_type)
     try:
-        log.debug("trying a GET request")
-        async with aiofiles.open(file_path, "wb") as f, session.get(url) as r:
-            log.debug("got GET response awaitable")
+        async with session.get(file_info.url) as r:
             file_size: int | None = None
             if content_length := r.headers.get("Content-Length"):
                 file_size = int(content_length)
 
-            pr.update(
-                description=f"{file_name}: downloading", total=file_size, completed=0
-            )
-            pr.start_task()
+            progress.start_task(task_id)
+            progress.update(task_id, total=file_size)
 
-            async for chunk in r.content.iter_chunked(CHUNK_SIZE_BYTES):
-                downloaded_file_hash.update(chunk)
-                await f.write(chunk)
-                pr.update(advance=len(chunk))
+            with file_path.open("wb") as f:
+                async for chunk in r.content.iter_chunked(CHUNK_SIZE_BYTES):
+                    downloaded_file_hash.update(chunk)
+                    f.write(chunk)
+                    progress.update(task_id, advance=len(chunk))
 
     except aiohttp.ClientError as e:
         message = f"{file_name}: {e}"
         if len(message) > 50:
             message = message[:47] + "..."
-        pr.update(description=message)
-        pr.stop_task()
+        progress.update(task_id, description=message)
         return
 
-    if checksum and downloaded_file_hash.hexdigest() != checksum:
-        pr.update(description=f"{file_name}: bad checksum")
-    else:
-        pr.update(description=f"{file_name}: downloaded")
-
-
-async def process_file(
-    *,
-    progress: rich.progress.Progress,
-    session: aiohttp.ClientSession,
-    url: str,
-    checksum_type: str,
-    checksum: str | None,
-    output_path: Path,
-) -> None:
-    file_name = urllib.parse.urlparse(url).path.rpartition("/")[-1]
-    file_path = output_path / file_name
-
-    progress_id = progress.add_task(f"{file_name}", start=False)
-    pr = ProgressInfo(progress, progress_id)
-
-    log.debug("checking if file exists")
-    log.debug("file path: %s", file_path.absolute())
-    log.debug("file exists: %s", file_path.exists())
-    log.debug("checksum: %s", checksum)
-    log.debug("pwd: %s", Path.cwd())
-    if file_path.exists() and checksum:
-        log.debug("file exists")
-        if await check_file_hash(
-            pr, file_path=file_path, checksum_type=checksum_type, checksum=checksum
-        ):
-            log.debug("hash matches")
-            return
-        else:
-            log.debug("hash does not match")
-    else:
-        log.debug("file does not exist or checksum not set")
-
-    await download_file(
-        pr,
-        file_path=file_path,
-        checksum_type=checksum_type,
-        checksum=checksum,
-        session=session,
-        url=url,
-    )
-
-
-async def gather_with_limit(limit: int, *coros: Coroutine[None, None, None]) -> None:
-    semaphore = asyncio.Semaphore(limit)
-
-    async def wrapper(coro: Coroutine[None, None, None]) -> None:
-        async with semaphore:
-            return await coro
-
-    await asyncio.gather(*(wrapper(coro) for coro in coros))
+    if file_info.checksum and downloaded_file_hash.hexdigest() != file_info.checksum:
+        progress.update(task_id, description=f"{file_name}: checksum mismatch")
 
 
 async def process_files(
-    info: Input, output_path: Path, *, max_parallel_downloads: int
+    info: input_model.Input, output_path: Path, *, max_parallel_downloads: int
 ) -> None:
+    files_info: list[FileInfo] = [
+        FileInfo(
+            url=fi.url,
+            checksum_type=fi.checksum_type or info.default_checksum_type,
+            checksum=fi.checksum,
+        )
+        for fi in info.files
+    ]
+
+    files_to_download = check_existing_file_hashes(files_info, output_path)
+
     with rich.progress.Progress() as progress:
         async with aiohttp.ClientSession() as session:
             tasks: list[Coroutine[None, None, None]] = []
 
-            for file in info.files:
-                checksum_type = file.checksum_type or info.default_checksum_type
+            for file_info in files_to_download:
                 tasks.append(
-                    process_file(
+                    download_file(
                         progress=progress,
                         session=session,
-                        url=file.url,
-                        checksum_type=checksum_type,
-                        checksum=file.checksum,
+                        file_info=file_info,
                         output_path=output_path,
                     )
                 )
 
-            await gather_with_limit(max_parallel_downloads, *tasks)
+            await util.gather_with_limit(max_parallel_downloads, *tasks)
 
 
 def dump_example_input(output_path: Path) -> None:
-    example_input = Input(
+    example_input = input_model.Input(
         files=[
-            FileInput(url="https://example-url-1", checksum="0123456789abcdef"),
-            FileInput(
+            input_model.FileInput(
+                url="https://example-url-1", checksum="0123456789abcdef"
+            ),
+            input_model.FileInput(
                 url="https://example-url-2",
                 checksum_type="sha256",
                 checksum="0123456789abcdef",
@@ -306,24 +203,30 @@ def main() -> int | None:
         dump_example_input(example_path)
         return 0
 
+    input_data = None
     try:
-        if input_path:
-            with input_path.open() as f:
-                info = Input.model_validate(yaml.safe_load(f))
-        else:
-            info = Input.model_validate(yaml.safe_load(sys.stdin))
+        with util.FileOrStdin(input_path) as f:
+            input_data = input_model.Input.model_validate(yaml.safe_load(f))
     except pydantic.ValidationError as e:
         for error in e.errors():
             error_path = "->".join(str(x) for x in error["loc"])
             print(f"[{error['type']}] {error_path}: {error['msg']}", file=sys.stderr)
         return 1
 
+    assert input_data
+
     if clean and output_path.exists():
         shutil.rmtree(output_path)
 
     output_path.mkdir(parents=True, exist_ok=True)
-    asyncio.run(
-        process_files(info, output_path, max_parallel_downloads=max_parallel_downloads)
-    )
+
+    try:
+        asyncio.run(
+            process_files(
+                input_data, output_path, max_parallel_downloads=max_parallel_downloads
+            )
+        )
+    except KeyboardInterrupt:
+        log.warning("Interrupted")
 
     return 0

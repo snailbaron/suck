@@ -21,6 +21,6 @@ repos:
 
       - id: pylint
         name: pylint
-        entry: uv run pylint
+        entry: uv run pylint --score no --output-format colorized
         types_or: [python]
         language: system
