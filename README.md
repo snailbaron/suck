@@ -44,3 +44,10 @@ options:
   --max-parallel-downloads N
                         max number of parallel downloads
 ```
+
+## Bonus
+
+If you want to check downloaded files with `md5sum`/`sha256sum`/whatever, [yq](https://github.com/mikefarah/yq) (a warpper around [jq](https://github.com/jqlang/jq)) can generate them nicely:
+```sh
+<input.yaml yq -r '.files[] | "\(.checksum)  my-output-dir/\(.url | split("/")[-1])"'
+```
